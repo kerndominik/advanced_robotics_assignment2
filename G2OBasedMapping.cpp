@@ -16,6 +16,26 @@
 
 #include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
 
+// Parameters
+// Optimization parameters
+#define OPTIMIZATION_ITERATIONS 15
+#define MIN_TO_OPTIMIZE 2
+// Noise parameters 
+#define X_NOISE 0.2
+#define Y_NOISE 0.2
+#define ROT_NOISE 0.2
+#define LASER_NOISE 100
+// ICP parameters
+#define ICP_MAX_ITERATIONS 20
+#define ICP_DIST_THRESHOLD 1.5
+// Parameters for adding vertices
+#define TRANS_THRESHOLD 0.3  // meters
+#define ROT_THRESHOLD 0.2  // radians
+// Loop closure parameters
+#define FIND_LOOP_CLOSURE false
+#define LOOP_CLOSURE_SEARCH_RADIUS TRANS_THRESHOLD  // meters
+#define LOOP_CLOSURE_MIN_ID_DIFF 10
+
 namespace tug_g2o_based_mapping
 {
 
@@ -120,9 +140,9 @@ G2OBasedMapping::G2OBasedMapping()
 
   // TODO
   // find appropriate parameters
-  double x_noise = 1;
-  double y_noise = 1;
-  double rot_noise = 1;    //rad
+  double x_noise = X_NOISE;
+  double y_noise = Y_NOISE;
+  double rot_noise = ROT_NOISE;    //rad
   double landmark_x_noise = 1;
   double landmark_y_noise = 1;
 
@@ -132,9 +152,9 @@ G2OBasedMapping::G2OBasedMapping()
   odom_noise_(2, 2) = 1 / (rot_noise * rot_noise);
 
   laser_noise_.fill(0.0);
-  laser_noise_(0, 0) = 1;
-  laser_noise_(1, 1) = 1;
-  laser_noise_(2, 2) = 1;
+  laser_noise_(0, 0) = LASER_NOISE;
+  laser_noise_(1, 1) = LASER_NOISE;
+  laser_noise_(2, 2) = LASER_NOISE;
 
   landmark_noise_.fill(0.0);
   landmark_noise_(0, 0) = 1 / (landmark_x_noise * landmark_x_noise);
@@ -188,18 +208,6 @@ void G2OBasedMapping::updateOdometry(const Odometry::ConstSharedPtr& odom)
   x_(1) += sin(theta) * dx_robot + cos(theta) * dy_robot;
   x_(2) += dtheta;
   x_(2) = atan2(sin(x_(2)), cos(x_(2)));
-
-  if (graph_.vertices().size() == 0)
-  {
-    addOdomVertex(x_(0), x_(1), x_(2), last_id_, true);
-  }
-  else
-  {
-    int new_id = last_id_ + 1;
-    addOdomVertex(x_(0), x_(1), x_(2), new_id, false);
-    addOdomEdge(last_id_, new_id);
-    last_id_ = new_id;
-  }
 
   last_odometry_ = *odom;
 }
@@ -257,9 +265,7 @@ bool computeICP(
   for (auto& p : src_transformed)
     p = R * p + T;
 
-  int max_iterations = 10;
-
-  for (int iter = 0; iter < max_iterations; iter++)
+  for (int iter = 0; iter < ICP_MAX_ITERATIONS; iter++)
   {
     std::vector<Eigen::Vector2d> src_corr;
     std::vector<Eigen::Vector2d> dst_corr;
@@ -280,7 +286,7 @@ bool computeICP(
         }
       }
       // optionally reject outliers based on distance
-      if (min_dist < 1.0) // reject outliers
+      if (min_dist < ICP_DIST_THRESHOLD) // reject outliers
       {
         src_corr.push_back(p);
         dst_corr.push_back(best_q);
@@ -293,7 +299,7 @@ bool computeICP(
 
     // --- Compute centroids ---
     Eigen::Vector2d mu_src(0, 0), mu_dst(0, 0);
-    for (size_t i = 0; i < src_corr.size(); ++i)
+    for (size_t i = 0; i < src_corr.size(); i++)
     {
       mu_src += src_corr[i];
       mu_dst += dst_corr[i];
@@ -303,7 +309,7 @@ bool computeICP(
 
     // --- Compute covariance ---
     Eigen::Matrix2d W = Eigen::Matrix2d::Zero();
-    for (size_t i = 0; i < src_corr.size(); ++i)
+    for (size_t i = 0; i < src_corr.size(); i++)
       W += (src_corr[i] - mu_src) * (dst_corr[i] - mu_dst).transpose();
 
     // --- SVD ---
@@ -354,6 +360,8 @@ void G2OBasedMapping::updateLaser(const LaserScan::ConstSharedPtr& laser)
         laser->range_max
       );
 
+      RCLCPP_INFO_STREAM(get_logger(),
+        "Adding first laser vertex " << last_id_ << " at pose: " << x_.transpose());
       addLaserVertex(x_(0), x_(1), x_(2), *laser, last_id_, true);
       return;
   }
@@ -364,170 +372,135 @@ void G2OBasedMapping::updateLaser(const LaserScan::ConstSharedPtr& laser)
   // 3. Check for loop closures
   // 4. Optimize the graph
 
-  try
+  // Adding vertex if the robot has moved enough since the last vertex
+  static Eigen::Vector3d last_vertex_pose = x_;
+
+  double dx = x_(0) - last_vertex_pose(0);
+  double dy = x_(1) - last_vertex_pose(1);
+  double dist = sqrt(dx * dx + dy * dy);
+  double dtheta = fabs(x_(2) - last_vertex_pose(2));
+
+  if (dist < TRANS_THRESHOLD && dtheta < ROT_THRESHOLD)
   {
+    // Not enough motion → skip
+    updateLocalization();
+    visualizeRobotPoses();
+    visualizeLaserScans();
+    return;
+  }
 
-    // ================================
-    // 1. Decide whether to add a vertex
-    // ================================
-    static Eigen::Vector3d last_vertex_pose = x_;
+  int new_id = last_id_;
+  new_id++;
+  RCLCPP_INFO_STREAM(get_logger(),
+      "Adding laser vertex " << new_id << " at pose: " << x_.transpose());
+  addLaserVertex(x_(0), x_(1), x_(2), *laser, new_id, false);
+  addOdomEdge(last_id_, new_id);
 
-    double dx = x_(0) - last_vertex_pose(0);
-    double dy = x_(1) - last_vertex_pose(1);
+  // Get vertices
+  auto v1 = graph_.vertex(last_id_);
+  auto v2 = graph_.vertex(new_id);
+
+  // Get scans
+  g2o::RawLaser* raw1 = dynamic_cast<g2o::RawLaser*>(v1->userData());
+  g2o::RawLaser* raw2 = dynamic_cast<g2o::RawLaser*>(v2->userData());
+
+  if (raw1 && raw2)
+  {
+    auto pts1 = laserToPoints(raw1);
+    auto pts2 = laserToPoints(raw2);
+
+    double dx_icp, dy_icp, dtheta_icp;
+
+    if (computeICP(pts2, pts1, dx_icp, dy_icp, dtheta_icp, dx, dy, dtheta))
+    {
+      addLaserEdge(last_id_, new_id, dx_icp, dy_icp, dtheta_icp, laser_noise_);
+    }
+  }
+
+#ifdef FIND_LOOP_CLOSURE
+  // ================================
+  // LOOP CLOSURE DETECTION
+  // ================================
+
+  // Get current pose + scan
+  std::vector<double> pose_curr;
+  graph_.vertex(new_id)->getEstimateData(pose_curr);
+
+  g2o::RawLaser* raw_curr =
+    dynamic_cast<g2o::RawLaser*>(graph_.vertex(new_id)->userData());
+
+  if (!raw_curr)
+    return;
+
+  bool loop_found = false;
+
+  // 1. Collect all valid candidates
+  struct LoopCandidate {
+    int id;
+    double distance;
+  };
+  std::vector<LoopCandidate> candidates;
+
+  for (int candidate_id : robot_pose_ids_) {
+    // Skip recent nodes to avoid matching with the current trajectory
+    if (abs(new_id - candidate_id) < LOOP_CLOSURE_MIN_ID_DIFF) continue;
+
+    std::vector<double> pose_old;
+    graph_.vertex(candidate_id)->getEstimateData(pose_old);
+
+    double dx = pose_curr[0] - pose_old[0];
+    double dy = pose_curr[1] - pose_old[1];
     double dist = sqrt(dx * dx + dy * dy);
 
-    double dtheta = fabs(x_(2) - last_vertex_pose(2));
-
-    // Thresholds (tune later!)
-    double trans_thresh = 0.2;   // meters
-    double rot_thresh   = 0.2;   // radians
-
-    if (dist < trans_thresh && dtheta < rot_thresh)
-    {
-      // Not enough motion → skip
-      updateLocalization();
-      visualizeRobotPoses();
-      visualizeLaserScans();
-      return;
+    if (dist < LOOP_CLOSURE_SEARCH_RADIUS) {
+      candidates.push_back({candidate_id, dist});
     }
+  }
 
-    int new_id = last_id_;
-    new_id++;
-    RCLCPP_INFO_STREAM(get_logger(),
-        "Adding vertex " << new_id << " at pose: " << x_.transpose());
-    addLaserVertex(x_(0), x_(1), x_(2), *laser, new_id, false);
+  // 2. Sort candidates by distance (closest first)
+  std::sort(candidates.begin(), candidates.end(), [](const LoopCandidate& a, const LoopCandidate& b) {
+    return a.distance < b.distance;
+  });
 
-    addOdomEdge(last_id_, new_id);
+  // 3. Try to connect to the 2 closest nodes
+  int closures_added = 0;
+  for (const auto& candidate : candidates) {
+    if (closures_added >= 2) break; // Limit to 2 closest
 
-    // Get vertices
-    auto v1 = graph_.vertex(last_id_);
-    auto v2 = graph_.vertex(new_id);
+    g2o::RawLaser* raw_old = dynamic_cast<g2o::RawLaser*>(graph_.vertex(candidate.id)->userData());
+    if (!raw_old) continue;
 
-    // // Get poses
-    // std::vector<double> pose1, pose2;
-    // v1->getEstimateData(pose1);
-    // v2->getEstimateData(pose2);
-
-    // Get scans
-    g2o::RawLaser* raw1 = dynamic_cast<g2o::RawLaser*>(v1->userData());
-    g2o::RawLaser* raw2 = dynamic_cast<g2o::RawLaser*>(v2->userData());
-
-    if (raw1 && raw2)
-    {
-      auto pts1 = laserToPoints(raw1);
-      auto pts2 = laserToPoints(raw2);
-
-      double dx_icp, dy_icp, dtheta_icp;
-
-      if (computeICP(pts2, pts1, dx_icp, dy_icp, dtheta_icp, dx, dy, dtheta))
-      {
-        addLaserEdge(last_id_, new_id, dx_icp, dy_icp, dtheta_icp, laser_noise_);
+    auto pts_curr = laserToPoints(raw_curr, pose_curr);
+    auto pts_old = laserToPoints(raw_old); 
+    
+    double dx_icp, dy_icp, dtheta_icp;
+    
+    // Use the difference in current estimates as a 'guess' for ICP
+    if (computeICP(pts_curr, pts_old, dx_icp, dy_icp, dtheta_icp)) {
+      double trans_norm = sqrt(dx_icp * dx_icp + dy_icp * dy_icp);
+      
+      if (trans_norm < LOOP_CLOSURE_SEARCH_RADIUS) { // Strict validation threshold
+        addLaserEdge(candidate.id, new_id, dx_icp, dy_icp, dtheta_icp, laser_noise_);
+        loop_found = true;
+        closures_added++;
+        RCLCPP_INFO(get_logger(), "Loop found with node %d (Dist: %.2f)", candidate.id, candidate.distance);
       }
     }
-
-    // ================================
-    // LOOP CLOSURE DETECTION
-    // ================================
-
-    // Get current pose + scan
-    std::vector<double> pose_curr;
-    graph_.vertex(new_id)->getEstimateData(pose_curr);
-
-    g2o::RawLaser* raw_curr =
-      dynamic_cast<g2o::RawLaser*>(graph_.vertex(new_id)->userData());
-
-    if (!raw_curr)
-      return;
-
-    // Parameters (tune later!)
-    double search_radius = 2.0;   // meters
-    int min_id_diff = 10;         // ignore recent nodes
-
-    bool loop_found = false;
-
-    for (size_t i = 0; i < robot_pose_ids_.size(); i++)
-    {
-      int candidate_id = robot_pose_ids_.at(i);
-
-      // Skip recent nodes
-      if (abs(new_id - candidate_id) < min_id_diff)
-        continue;
-
-      // Get candidate pose
-      std::vector<double> pose_old;
-      graph_.vertex(candidate_id)->getEstimateData(pose_old);
-
-      double dx = pose_curr[0] - pose_old[0];
-      double dy = pose_curr[1] - pose_old[1];
-      double dist = sqrt(dx * dx + dy * dy);
-
-      if (dist > search_radius)
-        continue;
-
-      // Get candidate scan
-      g2o::RawLaser* raw_old =
-        dynamic_cast<g2o::RawLaser*>(graph_.vertex(candidate_id)->userData());
-
-      if (!raw_old)
-        continue;
-
-      // Convert to point clouds
-      auto pts_curr = laserToPoints(raw_curr, pose_curr);
-      auto pts_old  = laserToPoints(raw_old, pose_old);
-
-      double dx_icp, dy_icp, dtheta_icp;
-
-      if (!computeICP(pts_curr, pts_old, dx_icp, dy_icp, dtheta_icp))
-        continue;
-
-      // ================================
-      // Validation (VERY IMPORTANT)
-      // ================================
-      double trans_norm = sqrt(dx_icp * dx_icp + dy_icp * dy_icp);
-
-      if (trans_norm > 1.0)   // reject bad matches
-        continue;
-
-      if (fabs(dtheta_icp) > 0.5) // ~30 degrees
-        continue;
-
-      // ================================
-      // ACCEPT LOOP CLOSURE
-      // ================================
-      RCLCPP_INFO_STREAM(get_logger(),
-        "Loop closure detected: " << new_id << " <-> " << candidate_id);
-
-      addLaserEdge(candidate_id, new_id,
-                  dx_icp, dy_icp, dtheta_icp,
-                  laser_noise_);
-
-      loop_found = true;
-      break; // one loop is enough
-    }
-
-    // -------------------------------
-    // Trigger optimization
-    // -------------------------------
-    static int counter = 0;
-    counter++;
-    if (loop_found || counter % min_to_optimize_ == 0)
-    {
-      RCLCPP_INFO_STREAM(get_logger(),
-        "Starting optimization...");
-      optimizeGraph();
-      RCLCPP_INFO_STREAM(get_logger(),
-        "Finished optimization...");
-    }
-
-    last_id_ = new_id;
-    last_vertex_pose = x_;
-
   }
-  catch (const std::exception& e)
+#endif
+
+  // -------------------------------
+  // Trigger optimization
+  // -------------------------------
+  static int counter = 0;
+  counter++;
+  if (loop_found || counter % min_to_optimize_ == 0)
   {
-    RCLCPP_ERROR_STREAM(get_logger(), "Error in laser update: " << e.what());
+    optimizeGraph();;
   }
 
+  last_id_ = new_id;
+  last_vertex_pose = x_;
 
   // Keep This - reports your update
   updateLocalization();
@@ -556,7 +529,7 @@ void G2OBasedMapping::init(double x, double y, double theta)
   robot_pose_set_ = true;
   first_opt_ = true;
 
-  min_to_optimize_ = 4;
+  min_to_optimize_ = MIN_TO_OPTIMIZE;
   last_id_ = 30;
 
   visualizeOldLandmarks();
@@ -731,8 +704,7 @@ void G2OBasedMapping::optimizeGraph()
   else if(!graph_.updateInitialization(vertex_set_, edge_set_))
     RCLCPP_ERROR_STREAM(get_logger(), "FAILED updateInitialization");
 
-  int iterations = 10;
-  graph_.optimize(iterations, !first_opt_);
+  graph_.optimize(OPTIMIZATION_ITERATIONS, !first_opt_);
   graph_.save("state_after.g2o");
 
   first_opt_ = false;
