@@ -18,23 +18,24 @@
 
 // Parameters
 // Optimization parameters
-#define OPTIMIZATION_ITERATIONS 15
-#define MIN_TO_OPTIMIZE 2
+#define OPTIMIZATION_ITERATIONS 10
+#define MIN_TO_OPTIMIZE 4
 // Noise parameters 
 #define X_NOISE 0.2
 #define Y_NOISE 0.2
 #define ROT_NOISE 0.2
-#define LASER_NOISE 100
+#define LASER_NOISE 1000
 // ICP parameters
-#define ICP_MAX_ITERATIONS 20
-#define ICP_DIST_THRESHOLD 1.5
+#define ICP_MAX_ITERATIONS 10
+#define ICP_DIST_THRESHOLD 1.0
 // Parameters for adding vertices
 #define TRANS_THRESHOLD 0.3  // meters
-#define ROT_THRESHOLD 0.2  // radians
+#define ROT_THRESHOLD 0.3  // radians
 // Loop closure parameters
-#define FIND_LOOP_CLOSURE false
+#define FIND_LOOP_CLOSURE true
 #define LOOP_CLOSURE_SEARCH_RADIUS TRANS_THRESHOLD  // meters
-#define LOOP_CLOSURE_MIN_ID_DIFF 10
+#define LOOP_CLOSURE_MIN_ID_DIFF 5
+#define MAX_CLOSURES_PER_NODE 2
 
 namespace tug_g2o_based_mapping
 {
@@ -198,7 +199,7 @@ void G2OBasedMapping::updateOdometry(const Odometry::ConstSharedPtr& odom)
 
   double dx = x_curr - x_last;
   double dy = y_curr - y_last;
-  double dtheta = yaw_curr - yaw_last;
+  double dtheta = atan2(sin(yaw_curr - yaw_last), cos(yaw_curr - yaw_last));
 
   double dx_robot =  cos(yaw_last) * dx + sin(yaw_last) * dy;
   double dy_robot = -sin(yaw_last) * dx + cos(yaw_last) * dy;
@@ -273,12 +274,12 @@ bool computeICP(
     // --- Nearest neighbor ---
     for (const auto& p : src_transformed)
     {
-      double min_dist = 1e9;
+      double min_dist = ICP_DIST_THRESHOLD;
       Eigen::Vector2d best_q;
 
       for (const auto& q : dst)
       {
-        double dist = (p - q).squaredNorm();
+        double dist = sqrt((p - q).squaredNorm());
         if (dist < min_dist)
         {
           min_dist = dist;
@@ -347,6 +348,175 @@ bool computeICP(
   return true;
 }
 
+bool G2OBasedMapping::addScanMatchingEdge(int id1, int id2)
+{
+  auto v1 = graph_.vertex(id1);
+  auto v2 = graph_.vertex(id2);
+
+  if (!v1 || !v2) return false;
+
+  // Get scans from user data
+  g2o::RawLaser* raw1 = dynamic_cast<g2o::RawLaser*>(v1->userData());
+  g2o::RawLaser* raw2 = dynamic_cast<g2o::RawLaser*>(v2->userData());
+
+  if (!raw1 || !raw2) return false;
+
+  // Keep points in their LOCAL frames
+  auto pts1 = laserToPoints(raw1); 
+  auto pts2 = laserToPoints(raw2);
+
+  // 1. Extract the current global estimates to form a relative guess
+  std::vector<double> p1, p2;
+  v1->getEstimateData(p1);
+  v2->getEstimateData(p2);
+
+  g2o::SE2 pose1(p1[0], p1[1], p1[2]);
+  g2o::SE2 pose2(p2[0], p2[1], p2[2]);
+
+  // 2. Compute the relative transformation guess (Node 1 -> Node 2)
+  g2o::SE2 relative_guess = pose1.inverse() * pose2;
+
+  double dx_icp, dy_icp, dtheta_icp;
+
+  // 3. Run ICP
+  // Note: We align pts2 (source) to pts1 (target)
+  if (computeICP(pts2, pts1, dx_icp, dy_icp, dtheta_icp, 
+                 relative_guess.translation().x(), 
+                 relative_guess.translation().y(), 
+                 relative_guess.rotation().angle()))
+  {
+    // 4. Add the refined relative edge to the graph
+    addLaserEdge(id1, id2, dx_icp, dy_icp, dtheta_icp, laser_noise_);
+    return true;
+  }
+
+  return false;
+}
+
+// bool detectAndAddLoopClosures(int id)
+// {
+// #ifndef FIND_LOOP_CLOSURE
+//   return false;
+// #endif
+
+//   bool loop_found = false;
+  
+//   // Get current pose
+//   auto current_vertex = graph_.vertex(id);
+//   if (!current_vertex) return false;
+
+//   std::vector<double> pose_curr;
+//   current_vertex->getEstimateData(pose_curr);
+
+//   // 1. Collect all valid candidates
+//   struct LoopCandidate {
+//     int id;
+//     double distance;
+//   };
+//   std::vector<LoopCandidate> candidates;
+
+//   for (int candidate_id : robot_pose_ids_) 
+//   {
+//     // Skip recent nodes to avoid matching with the current trajectory
+//     if (abs(id - candidate_id) < LOOP_CLOSURE_MIN_ID_DIFF) continue;
+
+//     auto candidate_vertex = graph_.vertex(candidate_id);
+//     if (!candidate_vertex) continue;
+
+//     std::vector<double> pose_old;
+//     candidate_vertex->getEstimateData(pose_old);
+
+//     // Calculate distance between the global estimates
+//     double dx = pose_curr[0] - pose_old[0];
+//     double dy = pose_curr[1] - pose_old[1];
+//     double dist = sqrt(dx * dx + dy * dy);
+
+//     if (dist < LOOP_CLOSURE_SEARCH_RADIUS) 
+//     {
+//       candidates.push_back({candidate_id, dist});
+//     }
+//   }
+
+//   // 2. Sort candidates by distance (closest first)
+//   std::sort(candidates.begin(), candidates.end(), 
+//     [](const LoopCandidate& a, const LoopCandidate& b) {
+//       return a.distance < b.distance;
+//   });
+
+//   // 3. Try to connect to the 2 closest nodes
+//   int closures_added = 0;
+//   for (const auto& candidate : candidates) 
+//   {
+//     if (closures_added >= 2) break; // Limit to 2 closest candidates
+
+//     // Try to add the edge using our robust relative ICP function
+//     if (addScanMatchingEdge(candidate.id, id)) 
+//     {
+//       loop_found = true;
+//       closures_added++;
+//       RCLCPP_INFO(get_logger(), "Loop closure added! Node %d -> Node %d (Dist: %.2f)", 
+//                   candidate.id, id, candidate.distance);
+//     }
+//   }
+
+//   return loop_found;
+// }
+
+bool G2OBasedMapping::detectAndAddLoopClosures(int id)
+{
+#ifndef FIND_LOOP_CLOSURE
+  return false;
+#endif
+
+  auto current_vertex = graph_.vertex(id);
+  if (!current_vertex) return false;
+
+  std::vector<double> p_curr;
+  current_vertex->getEstimateData(p_curr);
+  g2o::SE2 pose_curr(p_curr[0], p_curr[1], p_curr[2]);
+
+  bool any_loop_added = false;
+  int closures_this_cycle = 0;
+
+  // 1. Candidate Selection
+  // We iterate backwards to find the oldest matches first (better for global consistency)
+  for (int i = 0; i < static_cast<int>(robot_pose_ids_.size()); ++i)
+  {
+    int candidate_id = robot_pose_ids_[i];
+
+    // RULE 1: Temporal Exclusion 
+    // Don't match with itself or very recent history (avoid the "tail")
+    if (std::abs(id - candidate_id) < LOOP_CLOSURE_MIN_ID_DIFF) continue;
+
+    auto candidate_vertex = graph_.vertex(candidate_id);
+    if (!candidate_vertex) continue;
+
+    std::vector<double> p_cand;
+    candidate_vertex->getEstimateData(p_cand);
+    
+    double dist = std::sqrt(std::pow(p_curr[0] - p_cand[0], 2) + 
+                            std::pow(p_curr[1] - p_cand[1], 2));
+
+    // RULE 2: Spatial Proximity
+    if (dist < LOOP_CLOSURE_SEARCH_RADIUS)
+    {
+      // 2. Attempt Scan Matching
+      // Our addScanMatchingEdge handles the local ICP refinement
+      if (addScanMatchingEdge(candidate_id, id))
+      {        
+        RCLCPP_INFO(get_logger(), "Loop Closure: Node %d <-> %d (Dist: %.2fm)", 
+                    candidate_id, id, dist);
+        any_loop_added = true;
+        closures_this_cycle++;
+      }
+    }
+
+    if (closures_this_cycle >= MAX_CLOSURES_PER_NODE) break;
+  }
+
+  return any_loop_added;
+}
+
 // -----------------------------------------------------------------------------
 void G2OBasedMapping::updateLaser(const LaserScan::ConstSharedPtr& laser)
 {
@@ -366,20 +536,14 @@ void G2OBasedMapping::updateLaser(const LaserScan::ConstSharedPtr& laser)
       return;
   }
 
-  // TODO
-  // 1. Enter your laser scan update here
-  // 2. Build up the pose graph by adding odometry and laser edges
-  // 3. Check for loop closures
-  // 4. Optimize the graph
-
   // Adding vertex if the robot has moved enough since the last vertex
   static Eigen::Vector3d last_vertex_pose = x_;
 
   double dx = x_(0) - last_vertex_pose(0);
   double dy = x_(1) - last_vertex_pose(1);
-  double dist = sqrt(dx * dx + dy * dy);
-  double dtheta = fabs(x_(2) - last_vertex_pose(2));
+  double dtheta = atan2(sin(x_(2) - last_vertex_pose(2)), cos(x_(2) - last_vertex_pose(2)));
 
+  double dist = sqrt(dx * dx + dy * dy);
   if (dist < TRANS_THRESHOLD && dtheta < ROT_THRESHOLD)
   {
     // Not enough motion → skip
@@ -389,116 +553,20 @@ void G2OBasedMapping::updateLaser(const LaserScan::ConstSharedPtr& laser)
     return;
   }
 
-  int new_id = last_id_;
-  new_id++;
+  int new_id = last_id_ + 1;
   RCLCPP_INFO_STREAM(get_logger(),
       "Adding laser vertex " << new_id << " at pose: " << x_.transpose());
   addLaserVertex(x_(0), x_(1), x_(2), *laser, new_id, false);
   addOdomEdge(last_id_, new_id);
-
-  // Get vertices
-  auto v1 = graph_.vertex(last_id_);
-  auto v2 = graph_.vertex(new_id);
-
-  // Get scans
-  g2o::RawLaser* raw1 = dynamic_cast<g2o::RawLaser*>(v1->userData());
-  g2o::RawLaser* raw2 = dynamic_cast<g2o::RawLaser*>(v2->userData());
-
-  if (raw1 && raw2)
-  {
-    auto pts1 = laserToPoints(raw1);
-    auto pts2 = laserToPoints(raw2);
-
-    double dx_icp, dy_icp, dtheta_icp;
-
-    if (computeICP(pts2, pts1, dx_icp, dy_icp, dtheta_icp, dx, dy, dtheta))
-    {
-      addLaserEdge(last_id_, new_id, dx_icp, dy_icp, dtheta_icp, laser_noise_);
-    }
-  }
-
-#ifdef FIND_LOOP_CLOSURE
-  // ================================
-  // LOOP CLOSURE DETECTION
-  // ================================
-
-  // Get current pose + scan
-  std::vector<double> pose_curr;
-  graph_.vertex(new_id)->getEstimateData(pose_curr);
-
-  g2o::RawLaser* raw_curr =
-    dynamic_cast<g2o::RawLaser*>(graph_.vertex(new_id)->userData());
-
-  if (!raw_curr)
-    return;
-
-  bool loop_found = false;
-
-  // 1. Collect all valid candidates
-  struct LoopCandidate {
-    int id;
-    double distance;
-  };
-  std::vector<LoopCandidate> candidates;
-
-  for (int candidate_id : robot_pose_ids_) {
-    // Skip recent nodes to avoid matching with the current trajectory
-    if (abs(new_id - candidate_id) < LOOP_CLOSURE_MIN_ID_DIFF) continue;
-
-    std::vector<double> pose_old;
-    graph_.vertex(candidate_id)->getEstimateData(pose_old);
-
-    double dx = pose_curr[0] - pose_old[0];
-    double dy = pose_curr[1] - pose_old[1];
-    double dist = sqrt(dx * dx + dy * dy);
-
-    if (dist < LOOP_CLOSURE_SEARCH_RADIUS) {
-      candidates.push_back({candidate_id, dist});
-    }
-  }
-
-  // 2. Sort candidates by distance (closest first)
-  std::sort(candidates.begin(), candidates.end(), [](const LoopCandidate& a, const LoopCandidate& b) {
-    return a.distance < b.distance;
-  });
-
-  // 3. Try to connect to the 2 closest nodes
-  int closures_added = 0;
-  for (const auto& candidate : candidates) {
-    if (closures_added >= 2) break; // Limit to 2 closest
-
-    g2o::RawLaser* raw_old = dynamic_cast<g2o::RawLaser*>(graph_.vertex(candidate.id)->userData());
-    if (!raw_old) continue;
-
-    auto pts_curr = laserToPoints(raw_curr, pose_curr);
-    auto pts_old = laserToPoints(raw_old); 
-    
-    double dx_icp, dy_icp, dtheta_icp;
-    
-    // Use the difference in current estimates as a 'guess' for ICP
-    if (computeICP(pts_curr, pts_old, dx_icp, dy_icp, dtheta_icp)) {
-      double trans_norm = sqrt(dx_icp * dx_icp + dy_icp * dy_icp);
-      
-      if (trans_norm < LOOP_CLOSURE_SEARCH_RADIUS) { // Strict validation threshold
-        addLaserEdge(candidate.id, new_id, dx_icp, dy_icp, dtheta_icp, laser_noise_);
-        loop_found = true;
-        closures_added++;
-        RCLCPP_INFO(get_logger(), "Loop found with node %d (Dist: %.2f)", candidate.id, candidate.distance);
-      }
-    }
-  }
-#endif
-
-  // -------------------------------
-  // Trigger optimization
-  // -------------------------------
+  addScanMatchingEdge(last_id_, new_id);
+  bool loop_found = detectAndAddLoopClosures(new_id);
   static int counter = 0;
   counter++;
   if (loop_found || counter % min_to_optimize_ == 0)
   {
-    optimizeGraph();;
+    optimizeGraph();
+    counter = 0;
   }
-
   last_id_ = new_id;
   last_vertex_pose = x_;
 
