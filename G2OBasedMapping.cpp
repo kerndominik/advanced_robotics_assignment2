@@ -21,12 +21,12 @@
 #define OPTIMIZATION_ITERATIONS 10
 #define MIN_TO_OPTIMIZE 4
 // Noise parameters 
-#define X_NOISE 0.2
-#define Y_NOISE 0.2
-#define ROT_NOISE 0.2
+#define X_NOISE 0.5
+#define Y_NOISE 0.5
+#define ROT_NOISE 0.5
 #define LASER_NOISE 1000
 // ICP parameters
-#define ICP_MAX_ITERATIONS 10
+#define ICP_MAX_ITERATIONS 20
 #define ICP_DIST_THRESHOLD 1.0
 // Parameters for adding vertices
 #define TRANS_THRESHOLD 0.3  // meters
@@ -139,18 +139,13 @@ G2OBasedMapping::G2OBasedMapping()
   // Init
   init(0.0, 0.0, 0.0);
 
-  // TODO
-  // find appropriate parameters
-  double x_noise = X_NOISE;
-  double y_noise = Y_NOISE;
-  double rot_noise = ROT_NOISE;    //rad
   double landmark_x_noise = 1;
   double landmark_y_noise = 1;
 
   odom_noise_.fill(0.0);
-  odom_noise_(0, 0) = 1 / (x_noise * x_noise);
-  odom_noise_(1, 1) = 1 / (y_noise * y_noise);
-  odom_noise_(2, 2) = 1 / (rot_noise * rot_noise);
+  odom_noise_(0, 0) = 1 / (X_NOISE * X_NOISE);
+  odom_noise_(1, 1) = 1 / (Y_NOISE * Y_NOISE);
+  odom_noise_(2, 2) = 1 / (ROT_NOISE * ROT_NOISE);
 
   laser_noise_.fill(0.0);
   laser_noise_(0, 0) = LASER_NOISE;
@@ -241,6 +236,190 @@ std::vector<Eigen::Vector2d> laserToPoints(
   return points;
 }
 
+struct KDNode {
+  Eigen::Vector2d pt;
+  int left_idx = -1;
+  int right_idx = -1;
+};
+
+class KDTree2D {
+private:
+  std::vector<KDNode> nodes;
+  int root_idx = -1;
+
+  int buildRecursive(std::vector<Eigen::Vector2d>& pts, int start, int end, int depth) {
+    if (start >= end) return -1;
+
+    int axis = depth % 2;
+    int mid = start + (end - start) / 2;
+
+    // Partially sort the array so the median element is at the 'mid' position
+    std::nth_element(pts.begin() + start, pts.begin() + mid, pts.begin() + end,
+      [axis](const Eigen::Vector2d& a, const Eigen::Vector2d& b) {
+        return a[axis] < b[axis];
+      });
+
+    int node_idx = nodes.size();
+    nodes.push_back({pts[mid], -1, -1});
+
+    int left_child = buildRecursive(pts, start, mid, depth + 1);
+    int right_child = buildRecursive(pts, mid + 1, end, depth + 1);
+
+    nodes[node_idx].left_idx = left_child;
+    nodes[node_idx].right_idx = right_child;
+
+    return node_idx;
+  }
+
+  void searchRecursive(int node_idx, const Eigen::Vector2d& target, int depth, 
+                       double& best_dist_sq, Eigen::Vector2d& best_pt) const {
+    if (node_idx == -1) return;
+
+    const KDNode& node = nodes[node_idx];
+    double dist_sq = (node.pt - target).squaredNorm();
+
+    if (dist_sq < best_dist_sq) {
+      best_dist_sq = dist_sq;
+      best_pt = node.pt;
+    }
+
+    int axis = depth % 2;
+    double diff = target[axis] - node.pt[axis];
+
+    // Determine which branch to search first based on the splitting plane
+    int first_check = diff < 0 ? node.left_idx : node.right_idx;
+    int second_check = diff < 0 ? node.right_idx : node.left_idx;
+
+    searchRecursive(first_check, target, depth + 1, best_dist_sq, best_pt);
+
+    // Only search the other branch if the hyper-sphere crosses the splitting plane
+    if (diff * diff < best_dist_sq) {
+      searchRecursive(second_check, target, depth + 1, best_dist_sq, best_pt);
+    }
+  }
+
+public:
+  // Constructor takes points by value to allow in-place partitioning
+  KDTree2D(std::vector<Eigen::Vector2d> pts) {
+    if (pts.empty()) return;
+    nodes.reserve(pts.size());
+    root_idx = buildRecursive(pts, 0, pts.size(), 0);
+  }
+
+  bool nearestNeighbor(const Eigen::Vector2d& target, double max_dist_sq, Eigen::Vector2d& best_pt) const {
+    double best_dist_sq = max_dist_sq;
+    bool found = false;
+
+    searchRecursive(root_idx, target, 0, best_dist_sq, best_pt);
+
+    if (best_dist_sq < max_dist_sq) {
+      found = true;
+    }
+    return found;
+  }
+};
+
+// --- Updated ICP Function ---
+bool computeICPfast(
+  const std::vector<Eigen::Vector2d>& src,
+  const std::vector<Eigen::Vector2d>& dst,
+  double& dx,
+  double& dy,
+  double& dtheta,
+  double guess_dx = 0.0,
+  double guess_dy = 0.0,
+  double guess_dtheta = 0.0)
+{
+  if (src.empty() || dst.empty())
+    return false;
+
+  // 1. Build the Custom KD-Tree for the destination points ONCE
+  KDTree2D kd_tree(dst);
+
+  // Apply initial guess
+  Eigen::Matrix2d R;
+  R << cos(guess_dtheta), -sin(guess_dtheta),
+       sin(guess_dtheta),  cos(guess_dtheta);
+  Eigen::Vector2d T(guess_dx, guess_dy);
+
+  std::vector<Eigen::Vector2d> src_transformed = src;
+  for (auto& p : src_transformed) {
+    p = R * p + T;
+  }
+
+  // Optimization: use squared distance to avoid expensive sqrt() calls
+  const double max_dist_sq = ICP_DIST_THRESHOLD * ICP_DIST_THRESHOLD;
+
+  for (int iter = 0; iter < ICP_MAX_ITERATIONS; iter++)
+  {
+    std::vector<Eigen::Vector2d> src_corr;
+    std::vector<Eigen::Vector2d> dst_corr;
+    src_corr.reserve(src_transformed.size());
+    dst_corr.reserve(src_transformed.size());
+
+    // --- KD-Tree Nearest neighbor ---
+    for (const auto& p : src_transformed)
+    {
+      Eigen::Vector2d best_q;
+      if (kd_tree.nearestNeighbor(p, max_dist_sq, best_q))
+      {
+        src_corr.push_back(p);
+        dst_corr.push_back(best_q);
+      }
+    }
+
+    if (src_corr.size() < 5)
+      break;
+
+    // --- Compute centroids ---
+    Eigen::Vector2d mu_src(0, 0), mu_dst(0, 0);
+    for (size_t i = 0; i < src_corr.size(); i++)
+    {
+      mu_src += src_corr[i];
+      mu_dst += dst_corr[i];
+    }
+    mu_src /= src_corr.size();
+    mu_dst /= dst_corr.size();
+
+    // --- Compute covariance ---
+    Eigen::Matrix2d W = Eigen::Matrix2d::Zero();
+    for (size_t i = 0; i < src_corr.size(); i++)
+      W += (src_corr[i] - mu_src) * (dst_corr[i] - mu_dst).transpose();
+
+    // --- SVD ---
+    Eigen::JacobiSVD<Eigen::Matrix2d> svd(W, Eigen::ComputeFullU | Eigen::ComputeFullV);
+    Eigen::Matrix2d U = svd.matrixU();
+    Eigen::Matrix2d V = svd.matrixV();
+
+    Eigen::Matrix2d R_iter = V * U.transpose();
+
+    // Ensure proper rotation
+    if (R_iter.determinant() < 0)
+    {
+      V.col(1) *= -1;
+      R_iter = V * U.transpose();
+    }
+
+    Eigen::Vector2d T_iter = mu_dst - R_iter * mu_src;
+
+    // --- Apply transform ---
+    for (auto& p : src_transformed) {
+      p = R_iter * p + T_iter;
+    }
+
+    // --- Accumulate transform ---
+    R = R_iter * R;
+    T = R_iter * T + T_iter;
+  }
+
+  // --- Extract result ---
+  dtheta = atan2(R(1,0), R(0,0));
+  dx = T(0);
+  dy = T(1);
+
+  return true;
+}
+
 bool computeICP(
   const std::vector<Eigen::Vector2d>& src,
   const std::vector<Eigen::Vector2d>& dst,
@@ -274,24 +453,20 @@ bool computeICP(
     // --- Nearest neighbor ---
     for (const auto& p : src_transformed)
     {
-      double min_dist = ICP_DIST_THRESHOLD;
+      double min_dist_squared = ICP_DIST_THRESHOLD * ICP_DIST_THRESHOLD;
       Eigen::Vector2d best_q;
 
       for (const auto& q : dst)
       {
-        double dist = sqrt((p - q).squaredNorm());
-        if (dist < min_dist)
+        double dist_squared = (p - q).squaredNorm();
+        if (dist_squared < min_dist_squared)
         {
-          min_dist = dist;
+          min_dist_squared = dist_squared;
           best_q = q;
         }
       }
-      // optionally reject outliers based on distance
-      if (min_dist < ICP_DIST_THRESHOLD) // reject outliers
-      {
-        src_corr.push_back(p);
-        dst_corr.push_back(best_q);
-      }
+      src_corr.push_back(p);
+      dst_corr.push_back(best_q);
     }
 
     // Only required if you want to reject outliers based on distance
@@ -380,7 +555,7 @@ bool G2OBasedMapping::addScanMatchingEdge(int id1, int id2)
 
   // 3. Run ICP
   // Note: We align pts2 (source) to pts1 (target)
-  if (computeICP(pts2, pts1, dx_icp, dy_icp, dtheta_icp, 
+  if (computeICPfast(pts2, pts1, dx_icp, dy_icp, dtheta_icp, 
                  relative_guess.translation().x(), 
                  relative_guess.translation().y(), 
                  relative_guess.rotation().angle()))
@@ -393,81 +568,8 @@ bool G2OBasedMapping::addScanMatchingEdge(int id1, int id2)
   return false;
 }
 
-// bool detectAndAddLoopClosures(int id)
-// {
-// #ifndef FIND_LOOP_CLOSURE
-//   return false;
-// #endif
-
-//   bool loop_found = false;
-  
-//   // Get current pose
-//   auto current_vertex = graph_.vertex(id);
-//   if (!current_vertex) return false;
-
-//   std::vector<double> pose_curr;
-//   current_vertex->getEstimateData(pose_curr);
-
-//   // 1. Collect all valid candidates
-//   struct LoopCandidate {
-//     int id;
-//     double distance;
-//   };
-//   std::vector<LoopCandidate> candidates;
-
-//   for (int candidate_id : robot_pose_ids_) 
-//   {
-//     // Skip recent nodes to avoid matching with the current trajectory
-//     if (abs(id - candidate_id) < LOOP_CLOSURE_MIN_ID_DIFF) continue;
-
-//     auto candidate_vertex = graph_.vertex(candidate_id);
-//     if (!candidate_vertex) continue;
-
-//     std::vector<double> pose_old;
-//     candidate_vertex->getEstimateData(pose_old);
-
-//     // Calculate distance between the global estimates
-//     double dx = pose_curr[0] - pose_old[0];
-//     double dy = pose_curr[1] - pose_old[1];
-//     double dist = sqrt(dx * dx + dy * dy);
-
-//     if (dist < LOOP_CLOSURE_SEARCH_RADIUS) 
-//     {
-//       candidates.push_back({candidate_id, dist});
-//     }
-//   }
-
-//   // 2. Sort candidates by distance (closest first)
-//   std::sort(candidates.begin(), candidates.end(), 
-//     [](const LoopCandidate& a, const LoopCandidate& b) {
-//       return a.distance < b.distance;
-//   });
-
-//   // 3. Try to connect to the 2 closest nodes
-//   int closures_added = 0;
-//   for (const auto& candidate : candidates) 
-//   {
-//     if (closures_added >= 2) break; // Limit to 2 closest candidates
-
-//     // Try to add the edge using our robust relative ICP function
-//     if (addScanMatchingEdge(candidate.id, id)) 
-//     {
-//       loop_found = true;
-//       closures_added++;
-//       RCLCPP_INFO(get_logger(), "Loop closure added! Node %d -> Node %d (Dist: %.2f)", 
-//                   candidate.id, id, candidate.distance);
-//     }
-//   }
-
-//   return loop_found;
-// }
-
 bool G2OBasedMapping::detectAndAddLoopClosures(int id)
 {
-#ifndef FIND_LOOP_CLOSURE
-  return false;
-#endif
-
   auto current_vertex = graph_.vertex(id);
   if (!current_vertex) return false;
 
@@ -478,14 +580,9 @@ bool G2OBasedMapping::detectAndAddLoopClosures(int id)
   bool any_loop_added = false;
   int closures_this_cycle = 0;
 
-  // 1. Candidate Selection
-  // We iterate backwards to find the oldest matches first (better for global consistency)
   for (int i = 0; i < static_cast<int>(robot_pose_ids_.size()); ++i)
   {
     int candidate_id = robot_pose_ids_[i];
-
-    // RULE 1: Temporal Exclusion 
-    // Don't match with itself or very recent history (avoid the "tail")
     if (std::abs(id - candidate_id) < LOOP_CLOSURE_MIN_ID_DIFF) continue;
 
     auto candidate_vertex = graph_.vertex(candidate_id);
@@ -494,18 +591,15 @@ bool G2OBasedMapping::detectAndAddLoopClosures(int id)
     std::vector<double> p_cand;
     candidate_vertex->getEstimateData(p_cand);
     
-    double dist = std::sqrt(std::pow(p_curr[0] - p_cand[0], 2) + 
-                            std::pow(p_curr[1] - p_cand[1], 2));
+    double dist_squared = std::pow(p_curr[0] - p_cand[0], 2) + 
+                          std::pow(p_curr[1] - p_cand[1], 2);
 
-    // RULE 2: Spatial Proximity
-    if (dist < LOOP_CLOSURE_SEARCH_RADIUS)
+    if (dist_squared < LOOP_CLOSURE_SEARCH_RADIUS * LOOP_CLOSURE_SEARCH_RADIUS)
     {
-      // 2. Attempt Scan Matching
-      // Our addScanMatchingEdge handles the local ICP refinement
       if (addScanMatchingEdge(candidate_id, id))
       {        
         RCLCPP_INFO(get_logger(), "Loop Closure: Node %d <-> %d (Dist: %.2fm)", 
-                    candidate_id, id, dist);
+                    candidate_id, id, sqrt(dist_squared));
         any_loop_added = true;
         closures_this_cycle++;
       }
