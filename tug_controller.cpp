@@ -5,8 +5,8 @@
 #define FRONT_AXLE  0.256
 #define WHEELBASE   0.512
 #define K_STANLEY   4.0
-#define K_S         0.1
-#define K_P         100.0
+#define K_S         0.5
+#define K_P         3.0
 #define K_I         0.0
 #define ACCEL_LIM   0.3
 #define PI          3.1415
