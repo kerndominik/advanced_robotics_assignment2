@@ -35,6 +35,68 @@ void TugController::activate()
   RCLCPP_INFO(node_->get_logger(), "Activating tug controller");
 }
 
+Path TugController::smoothPath(const Path& path)
+{
+    if(path.poses.size() < 3)
+        return path;
+
+    Path smoothed = path;
+
+    const double alpha = 0.25;   // smoothing strength
+    const int iterations = 3;
+
+    for(int iter = 0; iter < iterations; iter++)
+    {
+        Path temp = smoothed;
+
+        for(size_t i = 1; i < path.poses.size() - 1; i++)
+        {
+            double x_prev = temp.poses[i-1].pose.position.x;
+            double x_curr = temp.poses[i].pose.position.x;
+            double x_next = temp.poses[i+1].pose.position.x;
+
+            double y_prev = temp.poses[i-1].pose.position.y;
+            double y_curr = temp.poses[i].pose.position.y;
+            double y_next = temp.poses[i+1].pose.position.y;
+
+            double x_avg = (x_prev + x_curr + x_next) / 3.0;
+            double y_avg = (y_prev + y_curr + y_next) / 3.0;
+
+            smoothed.poses[i].pose.position.x =
+                x_curr + alpha * (x_avg - x_curr);
+
+            smoothed.poses[i].pose.position.y =
+                y_curr + alpha * (y_avg - y_curr);
+        }
+    }
+
+    // Recompute orientations
+    for(size_t i = 0; i < smoothed.poses.size()-1; i++)
+    {
+        double dx =
+            smoothed.poses[i+1].pose.position.x -
+            smoothed.poses[i].pose.position.x;
+
+        double dy =
+            smoothed.poses[i+1].pose.position.y -
+            smoothed.poses[i].pose.position.y;
+
+        double yaw = atan2(dy, dx);
+
+        tf2::Quaternion q;
+        q.setRPY(0.0, 0.0, yaw);
+
+        smoothed.poses[i].pose.orientation =
+            tf2::toMsg(q);
+    }
+
+    // Last pose gets same orientation as previous
+    smoothed.poses.back().pose.orientation =
+        smoothed.poses[smoothed.poses.size()-2].pose.orientation;
+
+    return smoothed;
+}
+
 // -----------------------------------------------------------------------------
 void TugController::setPlan(const Path& path)
 {
@@ -54,7 +116,7 @@ void TugController::setPlan(const Path& path)
 
   last_path_received_time_ = current_time;
   RCLCPP_INFO(node_->get_logger(), "Received new path with %zu poses", path.poses.size());
-  global_path_ = path;
+  global_path_ = smoothPath(path);
 }
 
 double TugController::lateralControl(const PoseStamped& pose, const Twist& velocity){
@@ -104,26 +166,41 @@ double TugController::lateralControl(const PoseStamped& pose, const Twist& veloc
   return omega;
 }
 
-double TugController::longitudinalControl(const Twist& velocity){
-  rclcpp::Time current_time = node_->now();
-  double dt = (current_time - last_longitudinal_control_time_).seconds();
-  last_longitudinal_control_time_ = current_time;
+double TugController::longitudinalControl(const Twist& velocity)
+{
+    rclcpp::Time current_time = node_->now();
+    double dt = (current_time - last_longitudinal_control_time_).seconds();
+    last_longitudinal_control_time_ = current_time;
+  
+    double speed_error = max_speed_ - velocity.linear.x;
+    double unsat_output = K_P * speed_error + K_I * integral_error_;
 
-  // PI longitudinal controller
-  double speed_error = max_speed_ - velocity.linear.x;
-  integral_error_ += dt * speed_error;
-  double v = K_P * speed_error + K_I * integral_error_;
+    double sat_output = std::clamp(unsat_output, -max_speed_, max_speed_);
 
-  // Acceleration limiting
-  double dv = v - previous_cmd_vel_;
-  double max_dv = ACCEL_LIM * 0.05;
-  if(dv > max_dv)
-    v = previous_cmd_vel_ + max_dv;
-  if(dv < -max_dv)
-    v = previous_cmd_vel_ - max_dv;
-  v = std::clamp(v, -max_speed_, max_speed_);
-  previous_cmd_vel_ = v;
-  return v;
+    // Conditional integration (anti-windup)
+    bool controller_saturated = std::abs(unsat_output - sat_output) > 1e-6;
+    bool error_reduces_saturation =
+        (unsat_output > max_speed_ && speed_error < 0.0) ||
+        (unsat_output < -max_speed_ && speed_error > 0.0);
+
+    if(!controller_saturated || error_reduces_saturation)
+        integral_error_ += speed_error * dt;
+    
+    // Recompute output using updated integral
+    double v = K_P * speed_error + K_I * integral_error_;
+  
+    // Saturation again
+    v = std::clamp(v, -max_speed_, max_speed_);
+
+    // Acceleration limiting
+    double dv = v - previous_cmd_vel_;
+    double max_dv = ACCEL_LIM * dt;
+    if(dv > max_dv)
+        v = previous_cmd_vel_ + max_dv;
+    if(dv < -max_dv)
+        v = previous_cmd_vel_ - max_dv;
+    previous_cmd_vel_ = v;
+    return v;
 }
 
 // -----------------------------------------------------------------------------
